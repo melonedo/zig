@@ -4,7 +4,7 @@
 //!
 //! TLS support may be disabled via `std.options.http_disable_tls`.
 
-const std = @import("../std.zig");
+const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const http = std.http;
@@ -16,14 +16,16 @@ const assert = std.debug.assert;
 const use_vectors = builtin.zig_backend != .stage2_x86_64;
 
 const Client = @This();
-const proto = @import("protocol.zig");
+const proto = std.http.protocol;
+const TlsClient = @import("TlsClient.zig");
+const Certificate = @import("crypto/Certificate.zig");
 
 pub const disable_tls = std.options.http_disable_tls;
 
 /// Used for all client allocations. Must be thread-safe.
 allocator: Allocator,
 
-ca_bundle: if (disable_tls) void else std.crypto.Certificate.Bundle = if (disable_tls) {} else .{},
+ca_bundle: if (disable_tls) void else Certificate.Bundle = if (disable_tls) {} else .{},
 ca_bundle_mutex: std.Thread.Mutex = .{},
 
 /// When this is `true`, the next time this client performs an HTTPS request,
@@ -192,7 +194,7 @@ pub const ConnectionPool = struct {
 pub const Connection = struct {
     stream: net.Stream,
     /// undefined unless protocol is tls.
-    tls_client: if (!disable_tls) *std.crypto.tls.Client else void,
+    tls_client: if (!disable_tls) *TlsClient else void,
 
     /// The protocol that this connection is using.
     protocol: Protocol,
@@ -226,7 +228,7 @@ pub const Connection = struct {
             if (mem.startsWith(u8, @errorName(err), "TlsAlert")) return error.TlsAlert;
 
             switch (err) {
-                error.TlsConnectionTruncated, error.TlsRecordOverflow, error.TlsDecodeError, error.TlsBadRecordMac, error.TlsBadLength, error.TlsIllegalParameter, error.TlsUnexpectedMessage => return error.TlsFailure,
+                error.TlsConnectionTruncated, error.TlsRecordOverflow, error.TlsDecodeError, error.TlsBadRecordMac, error.TlsUnexpectedMessage => return error.TlsFailure,
                 error.ConnectionTimedOut => return error.ConnectionTimedOut,
                 error.ConnectionResetByPeer, error.BrokenPipe => return error.ConnectionResetByPeer,
                 else => return error.UnexpectedReadFailure,
@@ -387,7 +389,7 @@ pub const Connection = struct {
             if (disable_tls) unreachable;
 
             // try to cleanly close the TLS connection, for any server that cares.
-            _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
+            _ = conn.tls_client.writeEnd(conn.stream, "", true, .application_data) catch {};
             allocator.destroy(conn.tls_client);
         }
 
@@ -1373,10 +1375,10 @@ pub fn connectTcp(client: *Client, host: []const u8, port: u16, protocol: Connec
     if (protocol == .tls) {
         if (disable_tls) unreachable;
 
-        conn.data.tls_client = try client.allocator.create(std.crypto.tls.Client);
+        conn.data.tls_client = try client.allocator.create(TlsClient);
         errdefer client.allocator.destroy(conn.data.tls_client);
 
-        conn.data.tls_client.* = std.crypto.tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
+        conn.data.tls_client.* = TlsClient.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
         // This is appropriate for HTTPS because the HTTP headers contain
         // the content length which is used to detect truncation attacks.
         conn.data.tls_client.allow_truncation_attacks = true;
@@ -1431,6 +1433,7 @@ pub fn connectTunnel(
     proxy: *Proxy,
     tunnel_host: []const u8,
     tunnel_port: u16,
+    protocol: Connection.Protocol,
 ) !*Connection {
     if (!proxy.supports_connect) return error.TunnelNotSupported;
 
@@ -1449,8 +1452,13 @@ pub fn connectTunnel(
             client.connection_pool.release(client.allocator, conn);
         }
 
+        const scheme = switch (protocol) {
+            .plain => "http",
+            .tls => "https",
+        };
+
         const uri: Uri = .{
-            .scheme = "http",
+            .scheme = scheme,
             .user = null,
             .password = null,
             .host = tunnel_host,
