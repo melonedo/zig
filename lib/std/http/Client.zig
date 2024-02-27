@@ -1,6 +1,6 @@
 //! Connecting and opening requests are threadsafe. Individual requests are not.
 
-const std = @import("../std.zig");
+const std = @import("std");
 const testing = std.testing;
 const http = std.http;
 const mem = std.mem;
@@ -10,13 +10,15 @@ const Allocator = mem.Allocator;
 const assert = std.debug.assert;
 
 const Client = @This();
-const proto = @import("protocol.zig");
+const proto = std.http.protocol;
+const TlsClient = @import("TlsClient.zig");
+const Certificate = @import("crypto/Certificate.zig");
 
 pub const default_connection_pool_size = 32;
 pub const connection_pool_size = std.options.http_connection_pool_size;
 
 allocator: Allocator,
-ca_bundle: std.crypto.Certificate.Bundle = .{},
+ca_bundle: Certificate.Bundle = .{},
 ca_bundle_mutex: std.Thread.Mutex = .{},
 /// When this is `true`, the next time this client performs an HTTPS request,
 /// it will first rescan the system for root certificates.
@@ -150,7 +152,7 @@ pub const Connection = struct {
 
     stream: net.Stream,
     /// undefined unless protocol is tls.
-    tls_client: *std.crypto.tls.Client,
+    tls_client: *TlsClient,
 
     protocol: Protocol,
     host: []u8,
@@ -172,7 +174,7 @@ pub const Connection = struct {
             if (mem.startsWith(u8, @errorName(err), "TlsAlert")) return error.TlsAlert;
 
             switch (err) {
-                error.TlsConnectionTruncated, error.TlsRecordOverflow, error.TlsDecodeError, error.TlsBadRecordMac, error.TlsBadLength, error.TlsIllegalParameter, error.TlsUnexpectedMessage => return error.TlsFailure,
+                error.TlsConnectionTruncated, error.TlsRecordOverflow, error.TlsDecodeError, error.TlsBadRecordMac, error.TlsUnexpectedMessage => return error.TlsFailure,
                 error.ConnectionTimedOut => return error.ConnectionTimedOut,
                 error.ConnectionResetByPeer, error.BrokenPipe => return error.ConnectionResetByPeer,
                 else => return error.UnexpectedReadFailure,
@@ -286,7 +288,7 @@ pub const Connection = struct {
     pub fn close(conn: *Connection, client: *const Client) void {
         if (conn.protocol == .tls) {
             // try to cleanly close the TLS connection, for any server that cares.
-            _ = conn.tls_client.writeEnd(conn.stream, "", true) catch {};
+            _ = conn.tls_client.writeEnd(conn.stream, "", true, .application_data) catch {};
             client.allocator.destroy(conn.tls_client);
         }
 
@@ -906,10 +908,10 @@ pub fn connectUnproxied(client: *Client, host: []const u8, port: u16, protocol: 
     switch (protocol) {
         .plain => {},
         .tls => {
-            conn.data.tls_client = try client.allocator.create(std.crypto.tls.Client);
+            conn.data.tls_client = try client.allocator.create(TlsClient);
             errdefer client.allocator.destroy(conn.data.tls_client);
 
-            conn.data.tls_client.* = std.crypto.tls.Client.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
+            conn.data.tls_client.* = TlsClient.init(stream, client.ca_bundle, host) catch return error.TlsInitializationFailed;
             // This is appropriate for HTTPS because the HTTP headers contain
             // the content length which is used to detect truncation attacks.
             conn.data.tls_client.allow_truncation_attacks = true;
